@@ -1,0 +1,27 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.pins
+
+# Xcode
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# macOS
+.DS_Store
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data belongs under HEARD_HOME, never in the repository
+memory.jsonl
+state.json
+health.json
+heard.log
+
+# Local design and system research is intentionally never published
+RESEARCH.md
