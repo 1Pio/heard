@@ -27,6 +27,21 @@ actor MemoryStore {
     deinit { try? handle.close() }
 
     func append(_ event: MemoryEvent) throws {
+        try write(event)
+    }
+
+    func append(
+        _ event: MemoryEvent,
+        ifCurrent generation: Int,
+        generationGate: SystemAudioGeneration
+    ) throws -> Bool {
+        try generationGate.performIfCurrent(generation) {
+            try write(event)
+            return true
+        } ?? false
+    }
+
+    private func write(_ event: MemoryEvent) throws {
         var data = try JSONEncoder.heard.encode(event)
         data.append(0x0A)
         try handle.write(contentsOf: data)
@@ -38,11 +53,22 @@ enum MemoryMaintenance {
     struct TimestampProbe: Decodable { let ts: Date }
 
     static func forget(before cutoff: Date) throws -> (removed: Int, kept: Int) {
-        if let state = RuntimeState.load(), state.isAlive {
-            throw HeardError("Stop heard before deleting history, so capture and deletion cannot race.")
-        }
+        try requireStopped()
         try HeardPaths.prepare()
-        let data = try Data(contentsOf: HeardPaths.memory)
+        let result = rewrite(try Data(contentsOf: HeardPaths.memory), before: cutoff)
+        try replaceMemory(with: result.data)
+        return (result.removed, result.kept)
+    }
+
+    static func forgetAll() throws -> (removed: Int, kept: Int) {
+        try requireStopped()
+        try HeardPaths.prepare()
+        let result = rewriteAll(try Data(contentsOf: HeardPaths.memory))
+        try replaceMemory(with: result.data)
+        return (result.removed, result.kept)
+    }
+
+    static func rewrite(_ data: Data, before cutoff: Date) -> (data: Data, removed: Int, kept: Int) {
         let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
         var kept: [Data] = []
         var removed = 0
@@ -57,11 +83,25 @@ enum MemoryMaintenance {
         }
         var output = Data()
         for line in kept { output.append(line); output.append(0x0A) }
-        let temporary = HeardPaths.root.appendingPathComponent("memory.jsonl.rewrite-(UUID().uuidString)")
-        try output.write(to: temporary, options: [.atomic])
+        return (output, removed, kept.count)
+    }
+
+    static func rewriteAll(_ data: Data) -> (data: Data, removed: Int, kept: Int) {
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+        return (Data(), lines.count, 0)
+    }
+
+    private static func requireStopped() throws {
+        if let state = RuntimeState.load(), state.isAlive {
+            throw HeardError("Stop heard before deleting history, so capture and deletion cannot race.")
+        }
+    }
+
+    private static func replaceMemory(with data: Data) throws {
+        let temporary = HeardPaths.root.appendingPathComponent("memory.jsonl.rewrite-\(UUID().uuidString)")
+        try data.write(to: temporary, options: [.atomic])
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
         _ = try FileManager.default.replaceItemAt(HeardPaths.memory, withItemAt: temporary)
-        return (removed, kept.count)
     }
 }
 

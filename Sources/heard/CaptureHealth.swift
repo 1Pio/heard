@@ -7,6 +7,7 @@ struct CaptureHealthSnapshot: Codable, Sendable {
     let lastMicrophoneCallbackAt: Date?
     let systemAudioCallbacks: UInt64
     let lastSystemAudioCallbackAt: Date?
+    var systemAudioError: String? = nil
 
     static func load() -> Self? {
         guard let data = try? Data(contentsOf: HeardPaths.health) else { return nil }
@@ -20,6 +21,7 @@ final class CaptureHealth: @unchecked Sendable {
         var lastMicrophoneCallbackAt: Date?
         var systemAudioCallbacks: UInt64 = 0
         var lastSystemAudioCallbackAt: Date?
+        var systemAudioError: String?
     }
 
     private let lock = NSLock()
@@ -39,6 +41,10 @@ final class CaptureHealth: @unchecked Sendable {
         }
     }
 
+    func recordSystemAudioState(error: String?) {
+        lock.withLock { counters.systemAudioError = error }
+    }
+
     func snapshot(pid: Int32) -> CaptureHealthSnapshot {
         lock.withLock {
             CaptureHealthSnapshot(
@@ -47,7 +53,8 @@ final class CaptureHealth: @unchecked Sendable {
                 microphoneCallbacks: counters.microphoneCallbacks,
                 lastMicrophoneCallbackAt: counters.lastMicrophoneCallbackAt,
                 systemAudioCallbacks: counters.systemAudioCallbacks,
-                lastSystemAudioCallbackAt: counters.lastSystemAudioCallbackAt
+                lastSystemAudioCallbackAt: counters.lastSystemAudioCallbackAt,
+                systemAudioError: counters.systemAudioError
             )
         }
     }
@@ -77,6 +84,8 @@ enum StatusFormatter {
 
         if state.status == "starting", state.requestedSystemAudio == true {
             lines.append("system audio: initializing")
+        } else if let health, health.pid == state.pid, let error = health.systemAudioError {
+            lines.append("system audio: unavailable (\(error))")
         } else if state.captureSystemAudio {
             lines.append("system audio: listening")
         } else if state.requestedSystemAudio == true {
@@ -84,6 +93,9 @@ enum StatusFormatter {
             lines.append("system audio: unavailable (\(detail))")
         } else {
             lines.append("system audio: not requested (--mic-only)")
+        }
+        if let excludedApps = state.excludedApps, !excludedApps.isEmpty {
+            lines.append("excluded apps: \(excludedApps.joined(separator: ", "))")
         }
         return lines
     }

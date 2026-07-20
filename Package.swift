@@ -14,6 +14,7 @@ let package = Package(
             dependencies: [.product(name: "FluidAudio", package: "FluidAudio")],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
+                .linkedFramework("AppKit"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("ScreenCaptureKit")
             ]

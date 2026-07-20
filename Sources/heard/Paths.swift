@@ -13,6 +13,19 @@ enum HeardPaths {
     static let state = root.appendingPathComponent("state.json")
     static let health = root.appendingPathComponent("health.json")
     static let log = root.appendingPathComponent("heard.log")
+    static let config: URL = {
+        if ProcessInfo.processInfo.environment["HEARD_HOME"]?.isEmpty == false {
+            return root.appendingPathComponent("config.json")
+        }
+        let base: URL
+        if let override = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"], !override.isEmpty {
+            base = URL(fileURLWithPath: NSString(string: override).expandingTildeInPath, isDirectory: true)
+        } else {
+            base = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config", isDirectory: true)
+        }
+        return base.appendingPathComponent("heard/config.json")
+    }()
 
     static func prepare() throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -33,6 +46,7 @@ struct RuntimeState: Codable {
     var lastError: String?
     var requestedSystemAudio: Bool?
     var systemAudioError: String?
+    var excludedApps: [String]? = nil
 
     static func load() -> RuntimeState? {
         guard let data = try? Data(contentsOf: HeardPaths.state) else { return nil }

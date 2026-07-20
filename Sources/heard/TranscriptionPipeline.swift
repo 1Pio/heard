@@ -7,6 +7,7 @@ struct SpeechChunk: Sendable {
     let start: Date
     let end: Date
     let overlapsPrevious: Bool
+    let filterGeneration: Int?
 }
 
 actor SpeechChunker {
@@ -26,30 +27,44 @@ actor SpeechChunker {
     private var speech: [Float] = []
     private var speechStart: Date?
     private var continuedFromCut = false
+    private var filterGeneration: Int?
     private let emit: @Sendable (SpeechChunk) async -> Void
 
-    init(source: String, vad: VadManager, emit: @escaping @Sendable (SpeechChunk) async -> Void) async {
+    init(
+        source: String,
+        vad: VadManager,
+        filterGeneration: Int? = nil,
+        emit: @escaping @Sendable (SpeechChunk) async -> Void
+    ) async {
         self.source = source
         self.vad = vad
+        self.filterGeneration = filterGeneration
         self.vadState = await vad.makeStreamState()
         self.emit = emit
     }
 
-    func accept(_ samples: [Float], capturedAt: Date = Date()) async {
+    func accept(
+        _ samples: [Float],
+        capturedAt: Date = Date(),
+        filterGeneration: Int? = nil
+    ) async {
+        guard self.filterGeneration == filterGeneration else { return }
         pending.append(contentsOf: samples)
         while pending.count >= VadManager.chunkSize {
             let chunk = Array(pending.prefix(VadManager.chunkSize))
             pending.removeFirst(VadManager.chunkSize)
-            await process(chunk, capturedAt: capturedAt)
+            await process(chunk, capturedAt: capturedAt, filterGeneration: filterGeneration)
+            guard self.filterGeneration == filterGeneration else { return }
         }
     }
 
-    private func process(_ chunk: [Float], capturedAt: Date) async {
+    private func process(_ chunk: [Float], capturedAt: Date, filterGeneration: Int?) async {
         guard let result = try? await vad.processStreamingChunk(
             chunk,
             state: vadState,
             config: segmentation
         ) else { return }
+        guard self.filterGeneration == filterGeneration else { return }
         vadState = result.state
 
         let chunkDuration = Double(chunk.count) / 16_000
@@ -62,18 +77,33 @@ actor SpeechChunker {
         }
 
         if let event = result.event, event.kind == .speechEnd {
-            await flush(end: capturedAt, keepOverlap: false)
+            await flush(end: capturedAt, keepOverlap: false, filterGeneration: filterGeneration)
         } else if speech.count >= Int(Self.forcedCommitSeconds * 16_000) {
-            await flush(end: capturedAt, keepOverlap: true)
+            await flush(end: capturedAt, keepOverlap: true, filterGeneration: filterGeneration)
         }
+
+        guard self.filterGeneration == filterGeneration else { return }
 
         preRoll.append(contentsOf: chunk)
         if preRoll.count > 8_000 { preRoll.removeFirst(preRoll.count - 8_000) }
     }
 
-    func flush(end: Date = Date()) async { await flush(end: end, keepOverlap: false) }
+    func flush(end: Date = Date()) async {
+        await flush(end: end, keepOverlap: false, filterGeneration: filterGeneration)
+    }
 
-    private func flush(end: Date, keepOverlap: Bool) async {
+    func reset(filterGeneration: Int? = nil) async {
+        pending.removeAll(keepingCapacity: true)
+        preRoll.removeAll(keepingCapacity: true)
+        speech.removeAll(keepingCapacity: true)
+        speechStart = nil
+        continuedFromCut = false
+        self.filterGeneration = filterGeneration
+        vadState = await vad.makeStreamState()
+    }
+
+    private func flush(end: Date, keepOverlap: Bool, filterGeneration: Int?) async {
+        guard self.filterGeneration == filterGeneration else { return }
         let minimumSamples = Int(0.35 * 16_000)
         guard speech.count >= minimumSamples, let start = speechStart else {
             speech.removeAll(keepingCapacity: true)
@@ -86,9 +116,11 @@ actor SpeechChunker {
             samples: speech,
             start: start,
             end: end,
-            overlapsPrevious: continuedFromCut
+            overlapsPrevious: continuedFromCut,
+            filterGeneration: filterGeneration
         )
         await emit(emitted)
+        guard self.filterGeneration == filterGeneration else { return }
 
         if keepOverlap {
             let overlapCount = min(Int(Self.overlapSeconds * 16_000), speech.count)
@@ -108,6 +140,7 @@ actor TranscriptionPipeline {
     private let session: String
     private let asr: AsrManager
     private let diarizer: DiarizerManager?
+    private let systemAudioGeneration: SystemAudioGeneration?
     private var speakers = SpeakerManager(
         speakerThreshold: 0.58,
         embeddingThreshold: 0.42,
@@ -116,9 +149,15 @@ actor TranscriptionPipeline {
     )
     private var lastWords: [String: [String]] = [:]
 
-    init(store: MemoryStore, session: String, enableDiarization: Bool = true) async throws {
+    init(
+        store: MemoryStore,
+        session: String,
+        enableDiarization: Bool = true,
+        systemAudioGeneration: SystemAudioGeneration? = nil
+    ) async throws {
         self.store = store
         self.session = session
+        self.systemAudioGeneration = systemAudioGeneration
 
         fputs("[heard] loading local transcription model (first run downloads about 450 MB)...\n", stderr)
         let models = try await AsrModels.downloadAndLoad(version: .v3)
@@ -145,11 +184,13 @@ actor TranscriptionPipeline {
 
     func transcribe(_ chunk: SpeechChunk) async {
         do {
+            guard isCurrent(chunk) else { return }
             var decoderState = TdtDecoderState.make(decoderLayers: await asr.decoderLayerCount)
             let result = try await asr.transcribe(chunk.samples, decoderState: &decoderState)
+            guard isCurrent(chunk) else { return }
             var text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return }
-            if chunk.overlapsPrevious { text = removeRepeatedPrefix(from: text, source: chunk.source) }
+            if chunk.overlapsPrevious { text = removeRepeatedPrefix(from: text, chunk: chunk) }
             guard !text.isEmpty else { return }
 
             let speaker = identifySpeaker(for: chunk)
@@ -159,11 +200,12 @@ actor TranscriptionPipeline {
             let duration = max(0.01, chunk.end.timeIntervalSince(chunk.start))
             var elapsed = 0.0
             for (index, sentence) in sentences.enumerated() {
+                guard isCurrent(chunk) else { return }
                 let sentenceDuration = duration * Double(weights[index]) / Double(totalWeight)
                 let start = chunk.start.addingTimeInterval(elapsed)
                 elapsed += sentenceDuration
                 let end = index == sentences.count - 1 ? chunk.end : chunk.start.addingTimeInterval(elapsed)
-                try await store.append(MemoryEvent(
+                let event = MemoryEvent(
                     v: 1,
                     type: "utterance",
                     ts: end,
@@ -175,15 +217,35 @@ actor TranscriptionPipeline {
                     text: sentence,
                     confidence: result.confidence,
                     detail: nil
-                ))
+                )
+                guard try await append(event, for: chunk) else { return }
             }
-            lastWords[chunk.source] = normalizedWords(text).suffix(24).map { $0 }
+            guard isCurrent(chunk) else { return }
+            lastWords[historyKey(for: chunk)] = normalizedWords(text).suffix(24).map { $0 }
         } catch {
             try? await store.append(MemoryEvent(
                 v: 1, type: "error", ts: Date(), session: session,
                 detail: "transcription failed for \(chunk.source): \(error.localizedDescription)"
             ))
         }
+    }
+
+    private func isCurrent(_ chunk: SpeechChunk) -> Bool {
+        guard let generation = chunk.filterGeneration else { return true }
+        return systemAudioGeneration?.accepts(generation) == true
+    }
+
+    private func append(_ event: MemoryEvent, for chunk: SpeechChunk) async throws -> Bool {
+        guard let generation = chunk.filterGeneration else {
+            try await store.append(event)
+            return true
+        }
+        guard let systemAudioGeneration else { return false }
+        return try await store.append(
+            event,
+            ifCurrent: generation,
+            generationGate: systemAudioGeneration
+        )
     }
 
     private func identifySpeaker(for chunk: SpeechChunk) -> String {
@@ -212,10 +274,15 @@ actor TranscriptionPipeline {
         text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
     }
 
-    private func removeRepeatedPrefix(from text: String, source: String) -> String {
+    private func historyKey(for chunk: SpeechChunk) -> String {
+        guard let generation = chunk.filterGeneration else { return chunk.source }
+        return "\(chunk.source)#\(generation)"
+    }
+
+    private func removeRepeatedPrefix(from text: String, chunk: SpeechChunk) -> String {
         let words = text.split(whereSeparator: \.isWhitespace).map(String.init)
         let normalized = normalizedWords(text)
-        guard let previous = lastWords[source], !previous.isEmpty else { return text }
+        guard let previous = lastWords[historyKey(for: chunk)], !previous.isEmpty else { return text }
         let limit = min(16, previous.count, normalized.count)
         for count in stride(from: limit, through: 3, by: -1) {
             if Array(previous.suffix(count)) == Array(normalized.prefix(count)), words.count >= count {

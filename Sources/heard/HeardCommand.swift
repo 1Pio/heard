@@ -17,26 +17,41 @@ struct HeardCommand {
         let command = arguments.first ?? "status"
         switch command {
         case "start":
-            let unknown = arguments.dropFirst().filter { $0 != "--mic-only" && $0 != "--foreground" }
-            guard unknown.isEmpty else { throw HeardError("Unknown start option: \(unknown[0])") }
+            let options = try StartOptions.parse(Array(arguments.dropFirst()), allowForeground: true)
+            let configuration = try HeardConfiguration.load()
+            let excludedApps = try HeardConfiguration.merged(
+                configured: configuration.excludedApps,
+                commandLine: options.excludedApps
+            )
             try await start(
-                systemAudio: !arguments.contains("--mic-only"),
-                foreground: arguments.contains("--foreground")
+                systemAudio: !options.micOnly,
+                foreground: options.foreground,
+                excludedApps: excludedApps
             )
         case "pause": try pause()
         case "stop": try stop()
         case "status": status()
+        case "follow":
+            try await MemoryFollower.follow(options: FollowOptions.parse(Array(arguments.dropFirst())))
         case "forget": try forget(Array(arguments.dropFirst()))
         case "_run":
-            try await HeardDaemon(captureSystemAudio: !arguments.contains("--mic-only")).run()
+            let options = try StartOptions.parse(Array(arguments.dropFirst()), allowForeground: false)
+            try await HeardDaemon(
+                captureSystemAudio: !options.micOnly,
+                excludedApps: options.excludedApps
+            ).run()
         case "help", "--help", "-h": printHelp()
         default: throw HeardError("Unknown command '\(command)'. Run `heard help`.")
         }
     }
 
-    private static func start(systemAudio: Bool, foreground: Bool) async throws {
+    private static func start(systemAudio: Bool, foreground: Bool, excludedApps: [String]) async throws {
         try HeardPaths.prepare()
         if let state = RuntimeState.load(), state.isAlive {
+            let activeExcludedApps = state.excludedApps ?? []
+            guard state.requestedSystemAudio == systemAudio, activeExcludedApps == excludedApps else {
+                throw HeardError("heard is already running with different capture options. Run `heard stop`, then start it again.")
+            }
             if state.status == "paused" {
                 guard kill(state.pid, SIGUSR2) == 0 else { throw HeardError("Could not resume heard.") }
                 print("resumed")
@@ -51,7 +66,7 @@ struct HeardCommand {
         }
 
         if foreground {
-            try await HeardDaemon(captureSystemAudio: systemAudio).run()
+            try await HeardDaemon(captureSystemAudio: systemAudio, excludedApps: excludedApps).run()
             return
         }
 
@@ -60,7 +75,9 @@ struct HeardCommand {
         }
         let process = Process()
         process.executableURL = executable
-        process.arguments = ["_run"] + (systemAudio ? [] : ["--mic-only"])
+        process.arguments = ["_run"]
+            + (systemAudio ? [] : ["--mic-only"])
+            + excludedApps.flatMap { ["--exclude-app", $0] }
         process.environment = ProcessInfo.processInfo.environment
         let log = FileManager.default.fileExists(atPath: HeardPaths.log.path)
             ? try FileHandle(forWritingTo: HeardPaths.log)
@@ -113,11 +130,17 @@ struct HeardCommand {
         }
         print("memory: \(HeardPaths.memory.path)")
         print("log: \(HeardPaths.log.path)")
+        print("config: \(HeardPaths.config.path)")
     }
 
     private static func forget(_ arguments: [String]) throws {
+        if arguments == ["--all"] {
+            let result = try MemoryMaintenance.forgetAll()
+            print("deleted \(result.removed) records; kept 0")
+            return
+        }
         guard arguments.count == 2, arguments[0] == "--before" else {
-            throw HeardError("Usage: heard forget --before 2026-07-12T12:00:00Z")
+            throw HeardError("Usage: heard forget --before TIME | heard forget --all")
         }
         guard let cutoff = ISOTime.parse(arguments[1]) else {
             throw HeardError("Invalid timestamp. Use ISO 8601, for example 2026-07-12T12:00:00Z.")
@@ -134,12 +157,54 @@ struct HeardCommand {
           heard pause                pause without unloading models
           heard stop                 flush and stop
           heard status               show state and memory path
+          heard follow [--simple] [--since 5m]
+                                     show the live memory log
           heard forget --before TIME explicitly delete records older than ISO 8601 TIME
+          heard forget --all         explicitly delete every memory record
 
-        `heard start` captures microphone and system audio. The only optional mode,
-        `--mic-only`, avoids the system-audio permission. Nothing is ever pruned
-        automatically. Set HEARD_HOME to move the data directory.
+        Start options:
+          --mic-only                 capture only the microphone
+          --exclude-app BUNDLE_ID    exclude an app's system audio; repeatable
+
+        `heard start` captures microphone and system audio. `--mic-only` avoids
+        the system-audio permission. Persistent app exclusions belong in the
+        config file shown by `heard status`. Nothing is ever pruned automatically.
+        Set HEARD_HOME to move the data directory.
         """)
+    }
+}
+
+struct StartOptions: Equatable {
+    let micOnly: Bool
+    let foreground: Bool
+    let excludedApps: [String]
+
+    static func parse(_ arguments: [String], allowForeground: Bool) throws -> Self {
+        var micOnly = false
+        var foreground = false
+        var excludedApps: [String] = []
+        var index = 0
+        while index < arguments.count {
+            switch arguments[index] {
+            case "--mic-only":
+                guard !micOnly else { throw HeardError("--mic-only may only be specified once.") }
+                micOnly = true
+                index += 1
+            case "--foreground" where allowForeground:
+                guard !foreground else { throw HeardError("--foreground may only be specified once.") }
+                foreground = true
+                index += 1
+            case "--exclude-app":
+                guard index + 1 < arguments.count, !arguments[index + 1].hasPrefix("--") else {
+                    throw HeardError("--exclude-app requires an app bundle identifier such as com.apple.Music.")
+                }
+                excludedApps.append(arguments[index + 1])
+                index += 2
+            default:
+                throw HeardError("Unknown start option: \(arguments[index])")
+            }
+        }
+        return Self(micOnly: micOnly, foreground: foreground, excludedApps: excludedApps)
     }
 }
 
@@ -149,8 +214,41 @@ actor RunGate {
     func resume() { paused = false }
 }
 
+struct SystemAudioBatch: Sendable {
+    let samples: [Float]
+    let filterGeneration: Int
+}
+
+final class SystemAudioGeneration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = 0
+
+    func update(to generation: Int) {
+        lock.withLock { current = generation }
+    }
+
+    func accepts(_ generation: Int) -> Bool {
+        lock.withLock { current == generation }
+    }
+
+    func value() -> Int {
+        lock.withLock { current }
+    }
+
+    func performIfCurrent<T>(
+        _ generation: Int,
+        _ operation: () throws -> T
+    ) rethrows -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard current == generation else { return nil }
+        return try operation()
+    }
+}
+
 final class HeardDaemon: @unchecked Sendable {
     private let requestedSystemAudio: Bool
+    private let excludedApps: [String]
     private let gate = RunGate()
     private var state: RuntimeState
     private var signalSources: [DispatchSourceSignal] = []
@@ -160,13 +258,15 @@ final class HeardDaemon: @unchecked Sendable {
     private var memoryStore: MemoryStore?
     private var activeSession: String?
 
-    init(captureSystemAudio: Bool) {
+    init(captureSystemAudio: Bool, excludedApps: [String] = []) {
         requestedSystemAudio = captureSystemAudio
+        self.excludedApps = excludedApps
         let now = Date()
         state = RuntimeState(
             pid: getpid(), status: "starting", startedAt: now, updatedAt: now,
             captureSystemAudio: false, lastError: nil,
-            requestedSystemAudio: captureSystemAudio, systemAudioError: nil
+            requestedSystemAudio: captureSystemAudio, systemAudioError: nil,
+            excludedApps: excludedApps
         )
     }
 
@@ -186,19 +286,27 @@ final class HeardDaemon: @unchecked Sendable {
         ))
 
         let vad = try await VadManager()
+        let systemGeneration = SystemAudioGeneration()
         let pipeline = try await TranscriptionPipeline(
-            store: store, session: session, enableDiarization: requestedSystemAudio
+            store: store,
+            session: session,
+            enableDiarization: requestedSystemAudio,
+            systemAudioGeneration: systemGeneration
         )
         let micStream = AsyncStream<[Float]> { continuation in
             self.micContinuation = continuation
         }
-        let systemStream = AsyncStream<[Float]> { continuation in
+        let systemStream = AsyncStream<SystemAudioBatch> { continuation in
             self.systemContinuation = continuation
         }
         let micChunker = await SpeechChunker(source: "microphone", vad: vad) { chunk in
             await pipeline.transcribe(chunk)
         }
-        let systemChunker = await SpeechChunker(source: "system", vad: vad) { chunk in
+        let systemChunker = await SpeechChunker(
+            source: "system",
+            vad: vad,
+            filterGeneration: systemGeneration.value()
+        ) { chunk in
             await pipeline.transcribe(chunk)
         }
 
@@ -206,7 +314,10 @@ final class HeardDaemon: @unchecked Sendable {
             for await samples in micStream where !(await gate.paused) { await micChunker.accept(samples) }
         }
         let systemTask = Task {
-            for await samples in systemStream where !(await gate.paused) { await systemChunker.accept(samples) }
+            for await batch in systemStream {
+                guard systemGeneration.accepts(batch.filterGeneration), !(await gate.paused) else { continue }
+                await systemChunker.accept(batch.samples, filterGeneration: batch.filterGeneration)
+            }
         }
 
         let microphone = MicrophoneCapture { [weak self] samples in
@@ -220,9 +331,22 @@ final class HeardDaemon: @unchecked Sendable {
         ))
         var systemAudio: SystemAudioCapture?
         if requestedSystemAudio {
-            let capture = SystemAudioCapture { [weak self] samples in
+            let capture = SystemAudioCapture(
+                excludedBundleIdentifiers: excludedApps,
+                onFilterChange: {
+                    await systemChunker.reset(filterGeneration: systemGeneration.value())
+                },
+                onFilterInvalidated: { generation in
+                    systemGeneration.update(to: generation)
+                    Task { await systemChunker.reset(filterGeneration: generation) }
+                },
+                onFilterState: { error in health.recordSystemAudioState(error: error) }
+            ) { [weak self] samples, generation in
                 health.recordSystemAudio()
-                self?.systemContinuation?.yield(samples)
+                self?.systemContinuation?.yield(SystemAudioBatch(
+                    samples: samples,
+                    filterGeneration: generation
+                ))
             }
             do {
                 try await capture.start()
@@ -277,7 +401,7 @@ final class HeardDaemon: @unchecked Sendable {
     }
 
     private var micContinuation: AsyncStream<[Float]>.Continuation?
-    private var systemContinuation: AsyncStream<[Float]>.Continuation?
+    private var systemContinuation: AsyncStream<SystemAudioBatch>.Continuation?
 
     private func installSignals() {
         for number in [SIGUSR1, SIGUSR2, SIGTERM, SIGINT] { signal(number, SIG_IGN) }

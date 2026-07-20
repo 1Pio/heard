@@ -32,13 +32,74 @@ heard start             # microphone + Zoom/Meet/system audio
 heard pause             # models stay loaded; start resumes
 heard stop              # flush pending speech and stop
 heard status            # includes the exact memory path
+heard follow            # show the last 10 records, then follow live JSONL
+heard follow --simple --since 5m
 heard forget --before 2026-07-12T12:00:00Z
+heard forget --all
 ```
 
 Use `heard start --mic-only` when system audio is not needed. The first start
 downloads local models (about 450 MB for ASR plus smaller VAD/speaker models) and
 macOS asks for microphone and, unless `--mic-only` is used, Screen & System Audio
 Recording permission.
+
+## Excluding app audio
+
+Heard can prevent selected applications from contributing any system audio. Put
+their bundle identifiers in the user config shown by `heard status`. The default
+location is `~/.config/heard/config.json`, or `$XDG_CONFIG_HOME/heard/config.json`
+when `XDG_CONFIG_HOME` is set. If `HEARD_HOME` is set, the config moves with the
+rest of Heard's state to `$HEARD_HOME/config.json`.
+
+For example, this permanently excludes Apple Music:
+
+```json
+{
+  "excludedApps": ["com.apple.Music"]
+}
+```
+
+Bundle identifiers are used because app display names can change, be localized,
+or collide. Exclusions are case-insensitive, additive, and deduplicated. A
+one-session exclusion can also be supplied with a repeatable flag:
+
+```sh
+heard start --exclude-app com.apple.Music
+heard start --exclude-app com.apple.Music --exclude-app com.spotify.client
+```
+
+Start flags are added to the configured exclusions. If Heard is already running
+and the effective capture options changed, stop and start it so the new options
+take effect. Heard applies exclusions in ScreenCaptureKit before audio reaches
+speech detection or transcription. It also watches app launches and exits,
+temporarily pauses system-audio delivery while rebuilding the filter, and drops
+buffered system speech whenever the filter changes. If a live filter update
+fails, system-audio delivery stays paused instead of continuing unfiltered. If
+a configured app is already running but ScreenCaptureKit cannot resolve it,
+Heard leaves system audio unavailable and continues with microphone capture.
+
+## Following memory
+
+`heard follow` is the human-facing equivalent of remembering the memory path and
+running `tail -f` yourself. It prints the last 10 records, then streams new ones:
+
+```sh
+heard follow
+```
+
+Raw output remains the original agent-readable JSONL. `--simple` hides lifecycle
+events and prints only each utterance timestamp and text. `--since` adds all
+matching history from a compact lookback before continuing to follow:
+
+```sh
+heard follow --simple
+heard follow --simple --since 5m
+heard follow --since 30s
+```
+
+Lookbacks accept seconds (`s`), minutes (`m`), hours (`h`), and days (`d`). If a
+`forget` command atomically replaces the memory file while a follower is open,
+the follower switches to the new file and continues from its end.
 
 ## Memory contract
 
@@ -58,10 +119,14 @@ move the complete state directory. Every line is a standalone JSON object:
   embeddings (`remote-1`, `remote-2`, ...) so labels do not reset every chunk.
 - `heard` never deletes, rotates, summarizes, or prunes memory automatically.
 - `forget` is the only rewrite operation. It is explicit, atomic, preserves
-  unknown/malformed records, and refuses to run while capture is active.
+  unknown/malformed records when using `--before`, and refuses to run while
+  capture is active. `forget --all` removes every record, including malformed
+  lines.
 - The file contains text, timestamps, and lifecycle/error events, not raw audio.
 
-For an agent, the last five minutes are ordinary JSONL filtering. For example:
+For an agent, the last five minutes remain ordinary JSONL filtering. For a human,
+the equivalent is `heard follow --simple --since 5m`. An agent can still use the
+raw file directly, for example:
 
 ```sh
 python3 - <<'PY'
