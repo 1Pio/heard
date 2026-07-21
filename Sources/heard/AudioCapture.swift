@@ -50,44 +50,6 @@ final class Mono16kConverter: @unchecked Sendable {
     }
 }
 
-final class MicrophoneCapture: @unchecked Sendable {
-    private let engine = AVAudioEngine()
-    private let converter = Mono16kConverter()
-    private let onSamples: @Sendable ([Float]) -> Void
-
-    init(onSamples: @escaping @Sendable ([Float]) -> Void) { self.onSamples = onSamples }
-
-    func start() async throws {
-        let allowed: Bool
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized: allowed = true
-        case .notDetermined: allowed = await AVCaptureDevice.requestAccess(for: .audio)
-        default: allowed = false
-        }
-        guard allowed else {
-            throw HeardError("Microphone access was denied. Allow it for your terminal in System Settings > Privacy & Security > Microphone.")
-        }
-
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw HeardError("No usable default microphone was found.")
-        }
-        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
-            guard let self else { return }
-            let samples = self.converter.convert(buffer)
-            if !samples.isEmpty { self.onSamples(samples) }
-        }
-        engine.prepare()
-        try engine.start()
-    }
-
-    func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-    }
-}
-
 final class SystemAudioCapture: NSObject, @unchecked Sendable, SCStreamOutput, SCStreamDelegate {
     private let converter = Mono16kConverter()
     private let excludedBundleIdentifiers: Set<String>

@@ -320,14 +320,16 @@ final class HeardDaemon: @unchecked Sendable {
             }
         }
 
-        let microphone = MicrophoneCapture { [weak self] samples in
+        let microphone = MicrophoneCapture(
+            onState: { error in health.recordMicrophoneState(error: error) }
+        ) { [weak self] samples in
             health.recordMicrophone()
             self?.micContinuation?.yield(samples)
         }
         try await microphone.start()
         try await store.append(MemoryEvent(
             v: 1, type: "capture_ready", ts: Date(), session: session,
-            source: "microphone", detail: "live audio callbacks started"
+            source: "microphone", detail: "microphone engine started; awaiting live audio callbacks"
         ))
         var systemAudio: SystemAudioCapture?
         if requestedSystemAudio {
@@ -384,7 +386,7 @@ final class HeardDaemon: @unchecked Sendable {
             }
         }
 
-        microphone.stop()
+        await microphone.stop()
         healthTask.cancel()
         await systemAudio?.stop()
         micContinuation?.finish()

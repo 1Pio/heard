@@ -5,6 +5,7 @@ struct CaptureHealthSnapshot: Codable, Sendable {
     let writtenAt: Date
     let microphoneCallbacks: UInt64
     let lastMicrophoneCallbackAt: Date?
+    var microphoneError: String? = nil
     let systemAudioCallbacks: UInt64
     let lastSystemAudioCallbackAt: Date?
     var systemAudioError: String? = nil
@@ -19,6 +20,7 @@ final class CaptureHealth: @unchecked Sendable {
     private struct Counters {
         var microphoneCallbacks: UInt64 = 0
         var lastMicrophoneCallbackAt: Date?
+        var microphoneError: String?
         var systemAudioCallbacks: UInt64 = 0
         var lastSystemAudioCallbackAt: Date?
         var systemAudioError: String?
@@ -32,6 +34,10 @@ final class CaptureHealth: @unchecked Sendable {
             counters.microphoneCallbacks &+= 1
             counters.lastMicrophoneCallbackAt = Date()
         }
+    }
+
+    func recordMicrophoneState(error: String?) {
+        lock.withLock { counters.microphoneError = error }
     }
 
     func recordSystemAudio() {
@@ -52,6 +58,7 @@ final class CaptureHealth: @unchecked Sendable {
                 writtenAt: Date(),
                 microphoneCallbacks: counters.microphoneCallbacks,
                 lastMicrophoneCallbackAt: counters.lastMicrophoneCallbackAt,
+                microphoneError: counters.microphoneError,
                 systemAudioCallbacks: counters.systemAudioCallbacks,
                 lastSystemAudioCallbackAt: counters.lastSystemAudioCallbackAt,
                 systemAudioError: counters.systemAudioError
@@ -71,6 +78,8 @@ enum StatusFormatter {
         var lines = ["\(state.status) (pid \(state.pid))"]
         if state.status == "starting" {
             lines.append("microphone: initializing")
+        } else if let health, health.pid == state.pid, let error = health.microphoneError {
+            lines.append("microphone: unavailable (\(error))")
         } else if let health, health.pid == state.pid, let last = health.lastMicrophoneCallbackAt {
             let age = now.timeIntervalSince(last)
             if age <= 3 {

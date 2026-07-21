@@ -153,6 +153,12 @@ System audio uses Apple's ScreenCaptureKit and excludes `heard` itself. It
 captures Zoom, Meet, Teams, browser, and other app output without installing a
 virtual audio driver. macOS permission changes may require restarting the CLI.
 
+Heard watches the default microphone and the available Core Audio device list.
+When an input is connected, disconnected, or selected, it discards callbacks
+from the old engine and rebuilds capture against the new device. Brief device
+settling failures are retried for up to about four seconds. `heard status`
+reports the microphone as reconfiguring or unavailable while recovery runs.
+
 ## Development
 
 ```sh
