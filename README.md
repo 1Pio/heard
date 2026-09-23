@@ -1,20 +1,14 @@
-# heard
+# Heard
 
-[![CI](https://github.com/1Pio/heard/actions/workflows/ci.yml/badge.svg)](https://github.com/1Pio/heard/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/1Pio/heard/actions/workflows/ci.yml/badge.svg)](https://github.com/1Pio/heard/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-`heard` is one local command that keeps a timestamped, agent-readable memory of
-speech around your Mac. It is deliberately not a meeting-notes app: no UI, no
-summaries, no cloud, no database, and no automatic retention policy.
+Heard records separate microphone and Mac output tracks and streams each to [ElevenLabs Scribe v2 Realtime](https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime). It writes final, timestamped utterances to a local JSONL file that an agent can follow while a meeting is running. The microphone is labeled `you`; Mac output is labeled `remote`. Heard does not infer names or distinguish people mixed together in the system track.
 
-## Requirements
+## Requirements and install
 
-- Apple Silicon Mac
-- macOS 14 or newer
-- Xcode 16 or newer, including Swift 6
-- Approximately 500 MB for local models downloaded on first use
-
-## Install
+- Apple Silicon Mac running macOS 14.2 or newer, Xcode 16 or newer
+- ElevenLabs API key with Speech to Text access and available credits
+- Microphone and Screen & System Audio Recording permissions
 
 ```sh
 git clone https://github.com/1Pio/heard.git
@@ -22,152 +16,69 @@ cd heard
 ./install.sh
 ```
 
-The installer builds from source and atomically installs the executable to
-`${XDG_BIN_HOME:-~/.local/bin}/heard`.
+The installer builds from source and atomically installs `${XDG_BIN_HOME:-~/.local/bin}/heard`. It does not install a background service or change the Mac's output device. The launcher must have the required macOS capture permissions.
 
-## Usage
+## Credential setup
 
-```sh
-heard start             # microphone + Zoom/Meet/system audio
-heard pause             # models stay loaded; start resumes
-heard stop              # flush pending speech and stop
-heard status            # includes the exact memory path
-heard follow            # show the last 10 records, then follow live JSONL
-heard follow --simple --since 5m
-heard forget --before 2026-07-12T12:00:00Z
-heard forget --all
-```
-
-Use `heard start --mic-only` when system audio is not needed. The first start
-downloads local models (about 450 MB for ASR plus smaller VAD/speaker models) and
-macOS asks for microphone and, unless `--mic-only` is used, Screen & System Audio
-Recording permission.
-
-## Excluding app audio
-
-Heard can prevent selected applications from contributing any system audio. Put
-their bundle identifiers in the user config shown by `heard status`. The default
-location is `~/.config/heard/config.json`, or `$XDG_CONFIG_HOME/heard/config.json`
-when `XDG_CONFIG_HOME` is set. If `HEARD_HOME` is set, the config moves with the
-rest of Heard's state to `$HEARD_HOME/config.json`.
-
-For example, this permanently excludes Apple Music:
+`ELEVENLABS_API_KEY` takes precedence when present and nonempty. For GUI launchers such as Stream Deck, select an existing Keychain generic-password item in Heard's **local, uncommitted** config. The config contains only the service and account names, never the key:
 
 ```json
 {
-  "excludedApps": ["com.apple.Music"]
+  "elevenLabsKeychain": {
+    "service": "your-keychain-service",
+    "account": "your-keychain-account"
+  },
+  "excludedApps": []
 }
 ```
 
-Bundle identifiers are used because app display names can change, be localized,
-or collide. Exclusions are case-insensitive, additive, and deduplicated. A
-one-session exclusion can also be supplied with a repeatable flag:
+Create or edit `~/.config/heard/config.json` (or `$XDG_CONFIG_HOME/heard/config.json`). `heard status` prints the active config path. With `HEARD_HOME`, the config is `$HEARD_HOME/config.json`. Protect it with `chmod 600`; Heard never writes an API key to it or to a log. An installation without the environment variable or a valid Keychain selector receives a setup error.
+
+## Live use
 
 ```sh
-heard start --exclude-app com.apple.Music
-heard start --exclude-app com.apple.Music --exclude-app com.spotify.client
+heard start                   # mic + whole-Mac output
+heard status                  # capture, callback and error state
+heard follow --since 5m      # existing context, then continuous JSONL
+heard follow --simple         # compact human view
+heard pause
+heard start                   # resume
+heard stop                    # finish pending speech and close recordings
 ```
 
-Start flags are added to the configured exclusions. If Heard is already running
-and the effective capture options changed, stop and start it so the new options
-take effect. Heard applies exclusions in ScreenCaptureKit before audio reaches
-speech detection or transcription. It also watches app launches and exits,
-temporarily pauses system-audio delivery while rebuilding the filter, and drops
-buffered system speech whenever the filter changes. If a live filter update
-fails, system-audio delivery stays paused instead of continuing unfiltered. If
-a configured app is already running but ScreenCaptureKit cannot resolve it,
-Heard leaves system audio unavailable and continues with microphone capture.
+`heard start --mic-only` avoids system capture. `heard start --exclude-app com.apple.Music` excludes an app from the system tap for this run; `excludedApps` in the local config supplies persistent exclusions. Restart after changing the configured list. The global Core Audio tap captures the Mac's output mix, including conference audio, without selecting a display, app, or virtual device. Heard pauses delivery and rebuilds the tap when a listed app launches or exits; a failed exclusion refresh leaves system delivery unavailable and reports an error. If Core Audio setup fails, Heard tries ScreenCaptureKit and reports which source is unavailable.
 
-## Following memory
+Heard keeps the mic and system tracks separate through capture and transcription. They can overlap in time. Only ElevenLabs' delayed `committed_transcript_with_timestamps` events enter the canonical log; changing partials do not. The active model is `scribe_v2_realtime` on both tracks. A disconnected transcription stream leaves local recording active and reconnects with bounded backoff. Capture and transcription gaps appear as explicit events.
 
-`heard follow` is the human-facing equivalent of remembering the memory path and
-running `tail -f` yourself. It prints the last 10 records, then streams new ones:
+### Agent following
 
-```sh
-heard follow
-```
+Keep one `heard follow --since 5m` process open in a persistent terminal or tool session. Its default output is one JSON object per line and streams new records as they are fsynced. The agent can wait on that process for new output rather than rerunning extraction every few seconds. Start capture for an identified live meeting, check `heard status`, then consume `utterance` and gap/error events by `session` and `sequence`. If the follower reconnects, reread the recent meeting interval and deduplicate by event identity. A notification that Heard started is not proof that both audio tracks are producing speech; inspect callback freshness and the latest source events.
 
-Raw output remains the original agent-readable JSONL. `--simple` hides lifecycle
-events and prints only each utterance timestamp and text. `--since` adds all
-matching history from a compact lookback before continuing to follow:
+`heard follow --simple` prints text only for people reading along. `--since` accepts `s`, `m`, `h`, and `d`. The follower handles an explicit `heard forget` replacement of the memory file.
 
-```sh
-heard follow --simple
-heard follow --simple --since 5m
-heard follow --since 30s
-```
+## Local data and event contract
 
-Lookbacks accept seconds (`s`), minutes (`m`), hours (`h`), and days (`d`). If a
-`forget` command atomically replaces the memory file while a follower is open,
-the follower switches to the new file and continues from its end.
-
-## Memory contract
-
-The default memory is `~/.local/share/heard/memory.jsonl`. Set `HEARD_HOME` to
-move the complete state directory. Every line is a standalone JSON object:
+The default data root is `~/.local/share/heard`, or `$HEARD_HOME`. `memory.jsonl` is append-only until an explicit `heard forget`; state and health files are also local. Each final utterance has fractional-second `start`, `end`, and `ts`, a session-scoped `sequence`, `source`, `speaker`, `model`, `timing`, text, available word timestamps, and `receivedAt` for measuring delivery delay:
 
 ```json
-{"end":"2026-07-12T12:00:04.500Z","session":"...","source":"microphone","speaker":"you","start":"2026-07-12T12:00:01.200Z","text":"Let's prototype the new flow.","ts":"2026-07-12T12:00:04.500Z","type":"utterance","v":1}
+{"v":2,"type":"utterance","session":"...","sequence":12,"source":"microphone","speaker":"you","model":"scribe_v2_realtime","start":"2026-09-23T10:00:01.200Z","end":"2026-09-23T10:00:02.400Z","ts":"2026-09-23T10:00:02.400Z","text":"Let's start.","timing":"word","words":[{"text":"Let's","start":"2026-09-23T10:00:01.200Z","end":"2026-09-23T10:00:01.600Z"}]}
 ```
 
-- Records are appended and fsynced individually, so agents can safely read or
-  tail the file while capture continues.
-- Speech is committed after a natural pause, normally within about one second.
-  Long uninterrupted turns are committed every five seconds with overlapping
-  context and transcript-prefix de-duplication.
-- Microphone speech is always `you`. System speech uses session-long voice
-  embeddings (`remote-1`, `remote-2`, ...) so labels do not reset every chunk.
-- `heard` never deletes, rotates, summarizes, or prunes memory automatically.
-- `forget` is the only rewrite operation. It is explicit, atomic, preserves
-  unknown/malformed records when using `--before`, and refuses to run while
-  capture is active. `forget --all` removes every record, including malformed
-  lines.
-- The file contains text, timestamps, and lifecycle/error events, not raw audio.
+The example omits optional fields. A track's committed utterances are ordered and do not overlap each other; `you` and `remote` are allowed to overlap. `timing` marks provider word timing, shifted timing when an upstream timestamp regresses, or an estimate when word timing is absent. A `remote` label means only “heard in Mac output.”
 
-For an agent, the last five minutes remain ordinary JSONL filtering. For a human,
-the equivalent is `heard follow --simple --since 5m`. An agent can still use the
-raw file directly, for example:
+Heard also rotates one-minute mono 16 kHz PCM WAV files in `recordings/<session>/`, one series per source. These files preserve the exact audio sent to Scribe for recovery or later evaluation. They are private local data, not automatically pruned. Audio and transcript data are sent to ElevenLabs for transcription under that service's terms.
 
-```sh
-python3 - <<'PY'
-import json, pathlib, datetime
-p = pathlib.Path.home()/'.local/share/heard/memory.jsonl'
-cutoff = datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=5)
-for line in p.open():
-    row=json.loads(line)
-    if row.get('type')=='utterance' and datetime.datetime.fromisoformat(row['ts'].replace('Z','+00:00')) >= cutoff:
-        print(f"[{row['ts']}] {row['speaker']}: {row['text']}")
-PY
-```
+`heard forget --before ISO_TIME` and `heard forget --all` explicitly rewrite memory only while capture is stopped. They do not delete the WAV recordings.
 
-## Reliability boundaries
-
-Speaker diarization is intrinsically less reliable than source separation.
-`you` versus `remote-*` is strong because microphone and system audio are
-captured separately. Distinguishing two remote people is best effort and works
-best for turns longer than one second; overlapping remote speech and very short
-interjections may be labeled `remote` or attributed incorrectly. Speaker IDs are
-stable within one running session, not asserted as identities across days.
-
-System audio uses Apple's ScreenCaptureKit and excludes `heard` itself. It
-captures Zoom, Meet, Teams, browser, and other app output without installing a
-virtual audio driver. macOS permission changes may require restarting the CLI.
-
-Heard watches the default microphone and the available Core Audio device list.
-When an input is connected, disconnected, or selected, it discards callbacks
-from the old engine and rebuilds capture against the new device. Brief device
-settling failures are retried for up to about four seconds. `heard status`
-reports the microphone as reconfiguring or unavailable while recovery runs.
-
-## Development
+## Development and replay
 
 ```sh
 swift test
 HEARD_HOME=/tmp/heard-test .build/debug/heard status
+HEARD_HOME=/tmp/heard-test .build/debug/heard replay --file /path/to/meeting.m4a --start 60 --duration 30 --source system
 ```
 
-The engine is [FluidAudio](https://github.com/FluidInference/FluidAudio), pinned
-to 0.15.5. The project is intended for Apple Silicon and macOS 14 or newer.
+Replay uses `ffmpeg` to decode the selected interval and streams it at real speed through Scribe. A mixed recording is useful to inspect transcription, but separate mic and system files are needed to evaluate overlapping speakers. The legacy FluidAudio implementation remains in source for comparison; it is not the live default and its models are not downloaded at startup.
 
 ## License
 

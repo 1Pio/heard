@@ -63,7 +63,10 @@ struct MemoryLinePresenter {
         guard simple else { return String(data: data, encoding: .utf8) }
         guard let event = try? JSONDecoder.heard.decode(MemoryEvent.self, from: data),
               event.type == "utterance", let text = event.text else { return nil }
-        return "[\(ISOTime.string(event.ts))] \(text)"
+        let start = ISOTime.string(event.start ?? event.ts)
+        let end = ISOTime.string(event.end ?? event.ts)
+        let speaker = event.speaker ?? event.source ?? "unknown"
+        return "[\(start) - \(end)] \(speaker): \(text)"
     }
 }
 

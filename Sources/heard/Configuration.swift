@@ -1,17 +1,25 @@
 import Foundation
 
 struct HeardConfiguration: Decodable, Equatable {
-    private enum CodingKeys: String, CodingKey { case excludedApps }
+    struct KeychainSelector: Decodable, Equatable {
+        let service: String
+        let account: String
+    }
+
+    private enum CodingKeys: String, CodingKey { case excludedApps, elevenLabsKeychain }
 
     var excludedApps: [String] = []
+    var elevenLabsKeychain: KeychainSelector?
 
-    init(excludedApps: [String] = []) {
+    init(excludedApps: [String] = [], elevenLabsKeychain: KeychainSelector? = nil) {
         self.excludedApps = excludedApps
+        self.elevenLabsKeychain = elevenLabsKeychain
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         excludedApps = try container.decodeIfPresent([String].self, forKey: .excludedApps) ?? []
+        elevenLabsKeychain = try container.decodeIfPresent(KeychainSelector.self, forKey: .elevenLabsKeychain)
     }
 
     static func load(from url: URL = HeardPaths.config) throws -> Self {
@@ -27,7 +35,14 @@ struct HeardConfiguration: Decodable, Equatable {
 
     static func decode(_ data: Data) throws -> Self {
         let configuration = try JSONDecoder().decode(Self.self, from: data)
-        return try Self(excludedApps: normalize(configuration.excludedApps))
+        let selector = configuration.elevenLabsKeychain
+        if let selector {
+            guard !selector.service.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !selector.account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw HeardError("elevenLabsKeychain requires nonempty service and account fields")
+            }
+        }
+        return try Self(excludedApps: normalize(configuration.excludedApps), elevenLabsKeychain: selector)
     }
 
     static func merged(configured: [String], commandLine: [String]) throws -> [String] {

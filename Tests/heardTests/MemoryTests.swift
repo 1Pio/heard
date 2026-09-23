@@ -103,6 +103,33 @@ private actor ChunkCollector {
     }
 }
 
+@Test func keychainSelectorIsLocalConfigurationOnly() throws {
+    let configuration = try HeardConfiguration.decode(Data(#"{"excludedApps":[],"elevenLabsKeychain":{"service":"my-heard-credential","account":"stt"}}"#.utf8))
+    #expect(configuration.elevenLabsKeychain?.service == "my-heard-credential")
+    #expect(configuration.elevenLabsKeychain?.account == "stt")
+    #expect(try HeardConfiguration.decode(Data("{}".utf8)).elevenLabsKeychain == nil)
+    #expect(throws: HeardError.self) {
+        try HeardConfiguration.decode(Data(#"{"elevenLabsKeychain":{"service":" ","account":"stt"}}"#.utf8))
+    }
+}
+
+@Test func environmentCredentialHasAnExplicitNonemptyPrecedence() {
+    #expect(ElevenLabsCredential.preferredEnvironmentValue(in: ["ELEVENLABS_API_KEY": " test-value "]) == "test-value")
+    #expect(ElevenLabsCredential.preferredEnvironmentValue(in: ["ELEVENLABS_API_KEY": "  "]) == nil)
+    #expect(ElevenLabsCredential.preferredEnvironmentValue(in: [:]) == nil)
+}
+
+@Test func memoryPreservesTimedWordsAndOldWholeSecondDates() throws {
+    let old = Data(#"{"v":1,"type":"utterance","ts":"2026-07-12T12:00:00Z","text":"Old"}"#.utf8)
+    #expect(try JSONDecoder.heard.decode(MemoryEvent.self, from: old).text == "Old")
+    var event = MemoryEvent(v: 2, type: "utterance", ts: Date(timeIntervalSince1970: 100.5))
+    event.words = [MemoryWord(text: "Hello", start: Date(timeIntervalSince1970: 100.1),
+                              end: Date(timeIntervalSince1970: 100.4))]
+    let restored = try JSONDecoder.heard.decode(MemoryEvent.self, from: JSONEncoder.heard.encode(event))
+    #expect(restored.words?.first?.text == "Hello")
+    #expect(abs((restored.words?.first?.start.timeIntervalSince1970 ?? 0) - 100.1) < 0.001)
+}
+
 @Test func startOptionsCarryRepeatableAppExclusions() throws {
     let options = try StartOptions.parse(
         ["--exclude-app", "com.apple.Music", "--mic-only", "--exclude-app", "com.spotify.client"],
@@ -148,7 +175,7 @@ private actor ChunkCollector {
     let data = try JSONEncoder.heard.encode(event)
     let presenter = MemoryLinePresenter(simple: true, historicalCutoff: nil)
     let output = try #require(presenter.output(for: data, historical: true))
-    #expect(output == "[2025-07-12T12:30:56.000Z] Only the useful words.")
+    #expect(output == "[2025-07-12T12:30:56.000Z - 2025-07-12T12:30:56.000Z] unknown: Only the useful words.")
     #expect(!output.contains("confidence"))
 }
 

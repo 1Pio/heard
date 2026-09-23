@@ -65,7 +65,10 @@ struct RuntimeState: Codable {
 extension JSONEncoder {
     static var heard: JSONEncoder {
         let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            try container.encode(ISOTime.string(date))
+        }
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return encoder
     }
@@ -74,7 +77,13 @@ extension JSONEncoder {
 extension JSONDecoder {
     static var heard: JSONDecoder {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let value = try decoder.singleValueContainer().decode(String.self)
+            guard let date = ISOTime.parse(value) else {
+                throw DecodingError.dataCorruptedError(in: try decoder.singleValueContainer(), debugDescription: "Invalid ISO 8601 date")
+            }
+            return date
+        }
         return decoder
     }
 }

@@ -33,6 +33,8 @@ struct HeardCommand {
         case "status": status()
         case "follow":
             try await MemoryFollower.follow(options: FollowOptions.parse(Array(arguments.dropFirst())))
+        case "replay":
+            try await RecordingReplay.run(Array(arguments.dropFirst()))
         case "forget": try forget(Array(arguments.dropFirst()))
         case "_run":
             let options = try StartOptions.parse(Array(arguments.dropFirst()), allowForeground: false)
@@ -65,6 +67,10 @@ struct HeardCommand {
             return
         }
 
+        // Fail at the caller with a useful setup error, including GUI launchers.
+        // The secret remains in memory and is never passed as a process argument.
+        _ = try ElevenLabsCredential.load()
+
         if foreground {
             try await HeardDaemon(captureSystemAudio: systemAudio, excludedApps: excludedApps).run()
             return
@@ -90,19 +96,21 @@ struct HeardCommand {
         process.standardError = log
         try process.run()
 
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = Date().addingTimeInterval(15)
         while Date() < deadline {
-            if let state = RuntimeState.load(), state.pid == process.processIdentifier {
+            if let state = RuntimeState.load(), state.pid == process.processIdentifier,
+               state.status == "running" || state.status == "paused" {
                 print("\(state.status) (pid \(state.pid))")
                 print(HeardPaths.memory.path)
                 return
             }
+            if !process.isRunning { break }
             try await Task.sleep(for: .milliseconds(50))
         }
         guard process.isRunning else {
             throw HeardError("heard exited while starting. See \(HeardPaths.log.path)")
         }
-        print("starting (pid \(process.processIdentifier)); models may still be loading")
+        print("starting (pid \(process.processIdentifier)); check `heard status` for capture readiness")
         print(HeardPaths.memory.path)
     }
 
@@ -159,6 +167,8 @@ struct HeardCommand {
           heard status               show state and memory path
           heard follow [--simple] [--since 5m]
                                      show the live memory log
+          heard replay --file PATH [--start SECONDS] [--duration SECONDS] [--source microphone|system]
+                                     stream a recording through Scribe at live speed
           heard forget --before TIME explicitly delete records older than ISO 8601 TIME
           heard forget --all         explicitly delete every memory record
 
@@ -212,11 +222,6 @@ actor RunGate {
     private(set) var paused = false
     func pause() { paused = true }
     func resume() { paused = false }
-}
-
-struct SystemAudioBatch: Sendable {
-    let samples: [Float]
-    let filterGeneration: Int
 }
 
 final class SystemAudioGeneration: @unchecked Sendable {
@@ -281,85 +286,130 @@ final class HeardDaemon: @unchecked Sendable {
         memoryStore = store
         activeSession = session
         try await store.append(MemoryEvent(
-            v: 1, type: "session_start", ts: Date(), session: session,
-            detail: requestedSystemAudio ? "microphone+system" : "microphone"
+            v: 2, type: "session_start", ts: Date(), session: session,
+            detail: requestedSystemAudio ? "microphone+system; scribe_v2_realtime" : "microphone; scribe_v2_realtime"
         ))
 
-        let vad = try await VadManager()
-        let systemGeneration = SystemAudioGeneration()
-        let pipeline = try await TranscriptionPipeline(
-            store: store,
-            session: session,
-            enableDiarization: requestedSystemAudio,
-            systemAudioGeneration: systemGeneration
-        )
-        let micStream = AsyncStream<[Float]> { continuation in
+        let micStream = AsyncStream<AudioBatch>(bufferingPolicy: .bufferingNewest(100)) { continuation in
             self.micContinuation = continuation
         }
-        let systemStream = AsyncStream<SystemAudioBatch> { continuation in
+        let systemStream = AsyncStream<AudioBatch>(bufferingPolicy: .bufferingNewest(100)) { continuation in
             self.systemContinuation = continuation
         }
-        let micChunker = await SpeechChunker(source: "microphone", vad: vad) { chunk in
-            await pipeline.transcribe(chunk)
+        let micTrack = try StreamingTrack(source: "microphone", session: session, store: store) {
+            health.recordMicrophoneState(error: $0)
         }
-        let systemChunker = await SpeechChunker(
-            source: "system",
-            vad: vad,
-            filterGeneration: systemGeneration.value()
-        ) { chunk in
-            await pipeline.transcribe(chunk)
-        }
-
+        try await micTrack.start()
         let micTask = Task {
-            for await samples in micStream where !(await gate.paused) { await micChunker.accept(samples) }
-        }
-        let systemTask = Task {
-            for await batch in systemStream {
-                guard systemGeneration.accepts(batch.filterGeneration), !(await gate.paused) else { continue }
-                await systemChunker.accept(batch.samples, filterGeneration: batch.filterGeneration)
+            for await batch in micStream where !(await gate.paused) {
+                await micTrack.accept(batch)
             }
+            await micTrack.finish()
         }
 
         let microphone = MicrophoneCapture(
             onState: { error in health.recordMicrophoneState(error: error) }
         ) { [weak self] samples in
             health.recordMicrophone()
-            self?.micContinuation?.yield(samples)
+            self?.micContinuation?.yield(AudioBatch(samples: samples, capturedAtEnd: Date()))
         }
-        try await microphone.start()
+        do { try await microphone.start() }
+        catch {
+            micContinuation?.finish()
+            _ = await micTask.result
+            throw error
+        }
         try await store.append(MemoryEvent(
-            v: 1, type: "capture_ready", ts: Date(), session: session,
+            v: 2, type: "capture_ready", ts: Date(), session: session,
             source: "microphone", detail: "microphone engine started; awaiting live audio callbacks"
         ))
-        var systemAudio: SystemAudioCapture?
+        var stopCoreAudioTap: (() -> Void)?
+        var systemAudioFallback: SystemAudioCapture?
+        var systemTask: Task<Void, Never>?
+        var systemHeartbeat: Task<Void, Never>?
+        let systemFilterGeneration = SystemAudioGeneration()
         if requestedSystemAudio {
-            let capture = SystemAudioCapture(
-                excludedBundleIdentifiers: excludedApps,
-                onFilterChange: {
-                    await systemChunker.reset(filterGeneration: systemGeneration.value())
-                },
-                onFilterInvalidated: { generation in
-                    systemGeneration.update(to: generation)
-                    Task { await systemChunker.reset(filterGeneration: generation) }
-                },
-                onFilterState: { error in health.recordSystemAudioState(error: error) }
-            ) { [weak self] samples, generation in
-                health.recordSystemAudio()
-                self?.systemContinuation?.yield(SystemAudioBatch(
-                    samples: samples,
-                    filterGeneration: generation
-                ))
-            }
             do {
-                try await capture.start()
-                systemAudio = capture
+                if #available(macOS 14.2, *) {
+                    let capture = CoreAudioTapCapture(
+                        excludedBundleIdentifiers: excludedApps,
+                        onFilterInvalidated: { systemFilterGeneration.update(to: $0) },
+                        onState: { health.recordSystemAudioState(error: $0) }
+                    ) { [weak self] samples, generation in
+                        guard systemFilterGeneration.accepts(generation) else { return }
+                        health.recordSystemAudio(samples: samples)
+                        self?.systemContinuation?.yield(AudioBatch(samples: samples,
+                                                                   capturedAtEnd: Date(), filterGeneration: generation))
+                    }
+                    try capture.start()
+                    stopCoreAudioTap = { capture.stop() }
+                } else {
+                    throw HeardError("Core Audio system tap requires macOS 14.2")
+                }
                 state.captureSystemAudio = true
+                try await store.append(MemoryEvent(v: 2, type: "capture_ready", ts: Date(), session: session,
+                                                   source: "system", detail: "Core Audio global system tap started"))
             } catch {
-                state.systemAudioError = error.localizedDescription
-                try await store.append(MemoryEvent(
-                    v: 1, type: "warning", ts: Date(), session: session,
-                    detail: "system audio unavailable: \(error.localizedDescription)"
-                ))
+                try await store.append(MemoryEvent(v: 2, type: "warning", ts: Date(), session: session,
+                                                   source: "system", detail: "Core Audio tap unavailable; trying ScreenCaptureKit: \(error.localizedDescription)"))
+                let fallback = SystemAudioCapture(excludedBundleIdentifiers: excludedApps,
+                    onFilterInvalidated: { systemFilterGeneration.update(to: $0) },
+                    onFilterState: { health.recordSystemAudioState(error: $0) }) { [weak self] samples, generation in
+                    guard systemFilterGeneration.accepts(generation) else { return }
+                    health.recordSystemAudio(samples: samples)
+                    self?.systemContinuation?.yield(AudioBatch(samples: samples,
+                                                               capturedAtEnd: Date(), filterGeneration: generation))
+                }
+                do {
+                    try await fallback.start()
+                    systemAudioFallback = fallback
+                    state.captureSystemAudio = true
+                    try await store.append(MemoryEvent(v: 2, type: "capture_ready", ts: Date(), session: session,
+                                                       source: "system", detail: "ScreenCaptureKit fallback started"))
+                } catch {
+                    state.systemAudioError = error.localizedDescription
+                    health.recordSystemAudioState(error: error.localizedDescription)
+                    try await store.append(MemoryEvent(v: 2, type: "warning", ts: Date(), session: session,
+                                                       source: "system", detail: "system audio unavailable: \(error.localizedDescription)"))
+                }
+            }
+            if state.captureSystemAudio {
+                let track = try StreamingTrack(source: "system", session: session, store: store) {
+                    health.recordSystemAudioState(error: $0)
+                }
+                do { try await track.start() }
+                catch {
+                    stopCoreAudioTap?()
+                    await systemAudioFallback?.stop()
+                    await microphone.stop()
+                    micContinuation?.finish()
+                    _ = await micTask.result
+                    throw error
+                }
+                systemTask = Task {
+                    for await batch in systemStream where !(await gate.paused) || batch.synthetic {
+                        if let generation = batch.filterGeneration,
+                           !systemFilterGeneration.accepts(generation) { continue }
+                        await track.accept(batch)
+                    }
+                    await track.finish()
+                }
+                // Core Audio taps may deliver no buffers during complete silence.
+                // Keep Scribe's live socket and the source timeline moving.
+                let startedHeartbeatAt = Date()
+                let capturePID = state.pid
+                systemHeartbeat = Task { [weak self] in
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(200))
+                        if Task.isCancelled { break }
+                        let last = health.snapshot(pid: capturePID).lastSystemAudioCallbackAt ?? startedHeartbeatAt
+                        if Date().timeIntervalSince(last) > 0.35 {
+                            self?.systemContinuation?.yield(AudioBatch(
+                                samples: [Float](repeating: 0, count: 3_200),
+                                capturedAtEnd: Date().addingTimeInterval(-0.1), synthetic: true))
+                        }
+                    }
+                }
             }
         }
         state.status = await gate.paused ? "paused" : "running"
@@ -388,13 +438,14 @@ final class HeardDaemon: @unchecked Sendable {
 
         await microphone.stop()
         healthTask.cancel()
-        await systemAudio?.stop()
+        systemHeartbeat?.cancel()
+        stopCoreAudioTap?()
+        await systemAudioFallback?.stop()
         micContinuation?.finish()
         systemContinuation?.finish()
-        _ = await (micTask.result, systemTask.result)
-        await micChunker.flush()
-        await systemChunker.flush()
-        try await store.append(MemoryEvent(v: 1, type: "session_stop", ts: Date(), session: session))
+        _ = await micTask.result
+        if let systemTask { _ = await systemTask.result }
+        try await store.append(MemoryEvent(v: 2, type: "session_stop", ts: Date(), session: session))
         memoryStore = nil
         activeSession = nil
         state.status = "stopped"
@@ -402,8 +453,8 @@ final class HeardDaemon: @unchecked Sendable {
         try state.save()
     }
 
-    private var micContinuation: AsyncStream<[Float]>.Continuation?
-    private var systemContinuation: AsyncStream<SystemAudioBatch>.Continuation?
+    private var micContinuation: AsyncStream<AudioBatch>.Continuation?
+    private var systemContinuation: AsyncStream<AudioBatch>.Continuation?
 
     private func installSignals() {
         for number in [SIGUSR1, SIGUSR2, SIGTERM, SIGINT] { signal(number, SIG_IGN) }

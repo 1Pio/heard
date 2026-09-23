@@ -8,6 +8,7 @@ struct CaptureHealthSnapshot: Codable, Sendable {
     var microphoneError: String? = nil
     let systemAudioCallbacks: UInt64
     let lastSystemAudioCallbackAt: Date?
+    var lastSystemAudioSignalAt: Date? = nil
     var systemAudioError: String? = nil
 
     static func load() -> Self? {
@@ -23,6 +24,7 @@ final class CaptureHealth: @unchecked Sendable {
         var microphoneError: String?
         var systemAudioCallbacks: UInt64 = 0
         var lastSystemAudioCallbackAt: Date?
+        var lastSystemAudioSignalAt: Date?
         var systemAudioError: String?
     }
 
@@ -40,10 +42,13 @@ final class CaptureHealth: @unchecked Sendable {
         lock.withLock { counters.microphoneError = error }
     }
 
-    func recordSystemAudio() {
+    func recordSystemAudio(samples: [Float]) {
         lock.withLock {
             counters.systemAudioCallbacks &+= 1
             counters.lastSystemAudioCallbackAt = Date()
+            if samples.contains(where: { abs($0) > 0.0005 }) {
+                counters.lastSystemAudioSignalAt = Date()
+            }
         }
     }
 
@@ -61,6 +66,7 @@ final class CaptureHealth: @unchecked Sendable {
                 microphoneError: counters.microphoneError,
                 systemAudioCallbacks: counters.systemAudioCallbacks,
                 lastSystemAudioCallbackAt: counters.lastSystemAudioCallbackAt,
+                lastSystemAudioSignalAt: counters.lastSystemAudioSignalAt,
                 systemAudioError: counters.systemAudioError
             )
         }
@@ -95,8 +101,21 @@ enum StatusFormatter {
             lines.append("system audio: initializing")
         } else if let health, health.pid == state.pid, let error = health.systemAudioError {
             lines.append("system audio: unavailable (\(error))")
+        } else if state.captureSystemAudio, let health, health.pid == state.pid {
+            if let last = health.lastSystemAudioCallbackAt,
+               now.timeIntervalSince(last) <= 3 {
+                if let signal = health.lastSystemAudioSignalAt {
+                    lines.append("system audio: capturing (live callbacks; last signal \(ageText(now.timeIntervalSince(signal))) ago)")
+                } else {
+                    lines.append("system audio: capture open (live silent callbacks)")
+                }
+            } else if health.systemAudioCallbacks == 0 {
+                lines.append("system audio: capture open (no callbacks yet)")
+            } else {
+                lines.append("system audio: capture open (no recent callbacks)")
+            }
         } else if state.captureSystemAudio {
-            lines.append("system audio: listening")
+            lines.append("system audio: capture open (health unavailable)")
         } else if state.requestedSystemAudio == true {
             let detail = state.systemAudioError ?? "permission or capture unavailable"
             lines.append("system audio: unavailable (\(detail))")

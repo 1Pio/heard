@@ -1,6 +1,12 @@
 import Darwin
 import Foundation
 
+struct MemoryWord: Codable {
+    let text: String
+    let start: Date
+    let end: Date
+}
+
 struct MemoryEvent: Codable {
     let v: Int
     let type: String
@@ -13,10 +19,17 @@ struct MemoryEvent: Codable {
     var text: String?
     var confidence: Float?
     var detail: String?
+    var sequence: UInt64? = nil
+    var model: String? = nil
+    var timing: String? = nil
+    var language: String? = nil
+    var words: [MemoryWord]? = nil
+    var receivedAt: Date? = nil
 }
 
 actor MemoryStore {
     private let handle: FileHandle
+    private var sequence: UInt64 = 0
 
     init() throws {
         try HeardPaths.prepare()
@@ -41,7 +54,12 @@ actor MemoryStore {
         } ?? false
     }
 
-    private func write(_ event: MemoryEvent) throws {
+    private func write(_ incoming: MemoryEvent) throws {
+        var event = incoming
+        if event.v >= 2 {
+            sequence &+= 1
+            event.sequence = sequence
+        }
         var data = try JSONEncoder.heard.encode(event)
         data.append(0x0A)
         try handle.write(contentsOf: data)
