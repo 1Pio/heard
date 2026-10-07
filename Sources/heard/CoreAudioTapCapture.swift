@@ -25,6 +25,8 @@ final class CoreAudioTapCapture: @unchecked Sendable {
     private var active = false
     private var filterGeneration = 0
     private var applicationObservers: [NSObjectProtocol] = []
+    private var audioProcessObserver: AudioObjectPropertyListenerBlock?
+    private var excludedAudioProcesses: Set<AudioObjectID> = []
     private var tapID: AudioObjectID = kAudioObjectUnknown
     private var aggregateID: AudioDeviceID = kAudioObjectUnknown
     private var ioProc: AudioDeviceIOProcID?
@@ -54,7 +56,7 @@ final class CoreAudioTapCapture: @unchecked Sendable {
         }
         let excludedApplications = NSWorkspace.shared.runningApplications.filter { application in
             guard let identifier = application.bundleIdentifier?.lowercased(),
-                  excludedBundleIdentifiers.contains(identifier) else { return false }
+                  Self.isExcluded(bundleIdentifier: identifier, identifiers: excludedBundleIdentifiers) else { return false }
             return true
         }
         let excludedProcesses = try excludedApplications.map { application -> AudioObjectID in
@@ -63,7 +65,12 @@ final class CoreAudioTapCapture: @unchecked Sendable {
             }
             return object
         }
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcess] + excludedProcesses)
+        // Browser audio services can be absent from NSWorkspace's application list.
+        // Match Core Audio's own process objects so every configured helper is excluded.
+        let audioProcesses = try Self.processObjects(matching: excludedBundleIdentifiers)
+        lock.withLock { excludedAudioProcesses = Set(audioProcesses) }
+        let allExcludedProcesses = Array(Set([ownProcess] + excludedProcesses + audioProcesses))
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: allExcludedProcesses)
         description.name = "Heard System Audio"
         description.isPrivate = true
         description.muteBehavior = .unmuted
@@ -169,16 +176,39 @@ final class CoreAudioTapCapture: @unchecked Sendable {
                 guard let self,
                       let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                       let identifier = application.bundleIdentifier?.lowercased(),
-                      self.excludedBundleIdentifiers.contains(identifier) else { return }
+                      Self.isExcluded(bundleIdentifier: identifier, identifiers: self.excludedBundleIdentifiers) else { return }
                 self.invalidateAndRefresh()
             })
         }
+        var address = Self.audioProcessListAddress
+        let observer: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.refreshAudioProcessExclusions()
+        }
+        if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
+                                                &address, lifecycleQueue, observer) == noErr {
+            audioProcessObserver = observer
+        }
+        lifecycleQueue.async { [weak self] in self?.refreshAudioProcessExclusions() }
+    }
+
+    private func refreshAudioProcessExclusions() {
+        guard lock.withLock({ active && running }) else { return }
+        do {
+            let current = Set(try Self.processObjects(matching: excludedBundleIdentifiers))
+            if lock.withLock({ current != excludedAudioProcesses }) { invalidateAndRefresh() }
+        } catch { invalidateAndRefresh() }
     }
 
     private func removeApplicationObservers() {
         let center = NSWorkspace.shared.notificationCenter
         for observer in applicationObservers { center.removeObserver(observer) }
         applicationObservers.removeAll()
+        if let audioProcessObserver {
+            var address = Self.audioProcessListAddress
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
+                                                   &address, lifecycleQueue, audioProcessObserver)
+            self.audioProcessObserver = nil
+        }
     }
 
     private func invalidateAndRefresh() {
@@ -243,6 +273,50 @@ final class CoreAudioTapCapture: @unchecked Sendable {
         channel.update(from: mono, count: mono.count)
         let converted = converter.convert(input)
         if !converted.isEmpty { onSamples(converted, generation) }
+    }
+
+    static func isExcluded(bundleIdentifier: String, identifiers: Set<String>) -> Bool {
+        let bundle = bundleIdentifier.lowercased()
+        return identifiers.contains { bundle == $0 || bundle.hasPrefix($0 + ".") }
+    }
+
+    private static var audioProcessListAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyProcessObjectList,
+                                   mScope: kAudioObjectPropertyScopeGlobal,
+                                   mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private static func processObjects(matching identifiers: Set<String>) throws -> [AudioObjectID] {
+        guard !identifiers.isEmpty else { return [] }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        try check(AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                                 &address, 0, nil, &size), "list audio processes")
+        guard size > 0 else { return [] }
+        var objects = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        let status = objects.withUnsafeMutableBytes { buffer in
+            AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                       &address, 0, nil, &size, buffer.baseAddress!)
+        }
+        try check(status, "read audio processes")
+        return objects.prefix(Int(size) / MemoryLayout<AudioObjectID>.size).filter { object in
+            var bundleAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioProcessPropertyBundleID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let identifier = UnsafeMutablePointer<CFString?>.allocate(capacity: 1)
+            identifier.initialize(to: nil)
+            defer { identifier.deinitialize(count: 1); identifier.deallocate() }
+            var bundleSize = UInt32(MemoryLayout<CFString?>.size)
+            let result = AudioObjectGetPropertyData(object, &bundleAddress, 0, nil, &bundleSize, identifier)
+            guard result == noErr, let bundle = identifier.pointee else { return false }
+            return isExcluded(bundleIdentifier: bundle as String, identifiers: identifiers)
+        }
     }
 
     private static func processObject(for pid: pid_t) -> AudioObjectID? {
